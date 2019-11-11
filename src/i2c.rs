@@ -799,89 +799,97 @@ where
     type Error = Error;
 
     fn read(&mut self, addr: u8, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        if let Some((last, buffer)) = buffer.split_last_mut() {
-            // Send a START condition and set ACK bit
-            self.i2c.cr1.modify(|_, w| w.start().set_bit().ack().set_bit());
+        // Send a START condition and set ACK bit
+        self.i2c
+            .cr1
+            .modify(|_, w| w.start().set_bit().ack().set_bit());
 
-            // Wait until START condition was generated
-            while self.i2c.sr1.read().sb().bit_is_clear() {}
+        // Wait until START condition was generated
+        while {
+            let sr1 = self.i2c.sr1.read();
+            sr1.sb().bit_is_clear()
+        } {}
 
-            // Also wait until signalled we're master and everything is waiting for us
+        // Also wait until signalled we're master and everything is waiting for us
+        while {
+            let sr2 = self.i2c.sr2.read();
+            sr2.msl().bit_is_clear() && sr2.busy().bit_is_clear()
+        } {}
+
+        // Set up current address, we're trying to talk to
+        self.i2c
+            .dr
+            .write(|w| unsafe { w.bits((u32::from(addr) << 1) + 1) });
+
+        // Wait until address was sent
+        while {
+            let sr1 = self.i2c.sr1.read();
+            sr1.addr().bit_is_clear()
+        } {}
+
+        if buffer.len() <= 2 {
+
+            // Clear the ack flag and set the pos flag to the nack gets sent
+            // after the next received byte
+            self.i2c.cr1.modify(|_, w| w.ack().clear_bit().pos().set_bit());
+
+            // Clear addr by reading SR2
+            self.i2c.sr2.read();
+
+            // Wait until both bytes are received. Byte 1 will be in dr,
+            // and byte 2 will be in the shift register
             while {
-                let sr2 = self.i2c.sr2.read();
-                sr2.msl().bit_is_clear() && sr2.busy().bit_is_clear()
+                let sr1 = self.i2c.sr1.read();
+                sr1.btf().bit_is_clear()
             } {}
 
-            // Set up current address, we're trying to talk to
-            self.i2c.dr.write(|w| unsafe { w.bits((u32::from(addr) << 1) + 1) });
+            // Set the stop bit to finish the transaction
+            self.i2c.cr1.modify(|_, w| w.stop().set_bit());
 
-            // Wait until address was sent
-            while self.i2c.sr1.read().addr().bit_is_clear() {}
-
-            if buffer.len() <= 2 {
-
-                // Clear the ack flag and set the pos flag to the nack gets sent
-                // after the next received byte
-                self.i2c.cr1.modify(|_, w| w.ack().clear_bit().pos().set_bit());
-
-                // Clear addr by reading SR2
-                self.i2c.sr2.read();
-
-                // Wait until both bytes are received. Byte 1 will be in dr,
-                // and byte 2 will be in the shift register
-                while {
-                    let sr1 = self.i2c.sr1.read();
-                    sr1.btf().bit_is_clear()
-                } {}
-
-                // Set the stop bit to finish the transaction
-                self.i2c.cr1.modify(|_, w| w.stop().set_bit());
-
-                // Move both bytes into the buffer
-                for c in buffer {
-                    *c = self.recv_byte()?;
-                }
-            } else {
-
-                let n = buffer.len();
-
-                let (first, last) = buffer.split_at_mut(n-3);
-
-                // Clear addr by reading SR2
-                self.i2c.sr2.read();
-
-                // Receive n-3 bytes into buffer
-                for c in first {
-                    *c = self.recv_byte()?;
-                }
-
-                // Wait until the n-2 byte is in the data register
-                // and the n-1 byte is in the shift register
-                while {
-                    let sr1 = self.i2c.sr1.read();
-                    sr1.btf().bit_is_clear()
-                } {}
-
-                // Clear ack
-                self.i2c.cr1.modify(|_, w| w.ack().clear_bit().pos().clear_bit());
-
-                // Read the n-2 byte
-                last[0] = self.i2c.dr.read().bits() as u8;
-
-                // Wait until the n-1 byte is in the data register
-                // and the n byte is in the shift register
-                while {
-                    let sr1 = self.i2c.sr1.read();
-                    sr1.btf().bit_is_clear()
-                } {}
-
-                // Set the stop bit to finish the transaction
-                self.i2c.cr1.modify(|_, w| w.stop().set_bit());
-
-                // Receive the last 2 bytes
-                last[1] = self.recv_byte()?;
-                last[2] = self.recv_byte()?;
+            // Move both bytes into the buffer
+            for c in buffer {
+                *c = self.recv_byte()?;
             }
+        } else {
+
+            let n = buffer.len();
+
+            let (first, last) = buffer.split_at_mut(n-3);
+
+            // Clear addr by reading SR2
+            self.i2c.sr2.read();
+
+            // Receive n-3 bytes into buffer
+            for c in first {
+                *c = self.recv_byte()?;
+            }
+
+            // Wait until the n-2 byte is in the data register
+            // and the n-1 byte is in the shift register
+            while {
+                let sr1 = self.i2c.sr1.read();
+                sr1.btf().bit_is_clear()
+            } {}
+
+            // Clear ack
+            self.i2c.cr1.modify(|_, w| w.ack().clear_bit().pos().clear_bit());
+
+            // Read the n-2 byte
+            last[0] = self.i2c.dr.read().bits() as u8;
+
+            // Wait until the n-1 byte is in the data register
+            // and the n byte is in the shift register
+            while {
+                let sr1 = self.i2c.sr1.read();
+                sr1.btf().bit_is_clear()
+            } {}
+
+            // Set the stop bit to finish the transaction
+            self.i2c.cr1.modify(|_, w| w.stop().set_bit());
+
+            // Receive the last 2 bytes
+            last[1] = self.recv_byte()?;
+            last[2] = self.recv_byte()?;
         }
         // Fallthrough is success
         Ok(())
